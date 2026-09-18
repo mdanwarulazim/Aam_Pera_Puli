@@ -87,12 +87,32 @@ export async function saveOptimizationRun(
   directives: any[],
   validations: string[],
 ) {
+  // Strip non-serializable fields (like React icon components, functions, symbols)
+  const cleanDirectives = (directives || []).map((d, idx) => ({
+    note_index: typeof d.note_index === "number" ? d.note_index : idx,
+    text: d.text || "",
+    type: d.type || "",
+    detail: d.detail || "",
+    applied: Boolean(d.applied),
+    hours: Array.isArray(d.hours) ? d.hours : [],
+    factor: d.factor ?? null,
+  }));
+
+  const cleanSchedule = (schedule || []).map((s) => ({
+    hour: s.hour,
+    demand: s.demand ?? s.demand_kwh ?? 0,
+    solar: s.solar ?? s.solar_kwh ?? 0,
+    grid: s.grid ?? s.grid_kwh ?? 0,
+    battery: s.battery ?? s.battery_kwh ?? 0,
+    tariff: s.tariff ?? s.tariff_bdt_per_kwh ?? 0,
+  }));
+
   // Batch write all output collections
   const promises = [
     setDoc(doc(db, "runs", runId), { status: "SUCCESS", timestamp: Date.now(), latency_ms: 1240 }),
     setDoc(doc(db, "runs", "latest"), summary),
-    setDoc(doc(db, "schedules", runId), { hourly_plan: schedule }),
-    setDoc(doc(db, "directives", runId), { interpretations: directives }),
+    setDoc(doc(db, "schedules", runId), { hourly_plan: cleanSchedule }),
+    setDoc(doc(db, "directives", runId), { interpretations: cleanDirectives }),
     setDoc(doc(db, "validations", runId), { passed_checks: validations }),
   ];
   await Promise.all(promises);

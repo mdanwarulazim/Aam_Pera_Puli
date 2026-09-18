@@ -12,6 +12,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 import numpy as np
 from scipy.optimize import linprog
+import os
+import json
+from google import genai
 
 app = FastAPI(title="GRID LP Solver", version="1.0.0")
 
@@ -66,6 +69,51 @@ class SolveResponse(BaseModel):
     total_grid_cost_bdt: float
     total_grid_energy_kwh: float
     peak_grid_import_kwh: float
+
+
+class OptimizeEnergyBattery(BaseModel):
+    capacity_kwh: float
+    initial_energy_kwh: float
+    minimum_energy_kwh: float
+    max_charge_kwh_per_hour: float
+    max_discharge_kwh_per_hour: float
+
+class OptimizeEnergyHour(BaseModel):
+    hour: str
+    demand_kwh: float
+    solar_kwh: float
+    tariff_bdt_per_kwh: float
+
+class OptimizeEnergyRequest(BaseModel):
+    scenario_id: str
+    battery: OptimizeEnergyBattery
+    operator_notes: List[str]
+    hours: List[OptimizeEnergyHour]
+
+class StructuredAdjustment(BaseModel):
+    hours: List[int]
+    factor: Optional[float] = None
+    limit: Optional[float] = None
+
+class DirectiveInterpretation(BaseModel):
+    note_index: int
+    applies: bool
+    directive_type: str
+    structured_adjustment: Optional[StructuredAdjustment] = None
+
+class OutputHourlyPlan(BaseModel):
+    hour: int
+    grid_kwh: float
+    solar_used_kwh: float
+    battery_energy_after_kwh: float
+
+class OptimizeEnergyResponse(BaseModel):
+    scenario_id: str
+    directive_interpretation: List[DirectiveInterpretation]
+    hourly_plan: List[OutputHourlyPlan]
+    total_grid_kwh: float
+    total_cost_bdt: float
+    peak_grid_kwh: float
 
 
 # ── Solver ───────────────────────────────────────────────────────────────────
@@ -138,7 +186,12 @@ def solve_lp(req: SolveRequest):
         bounds.append((0.0, grid_ub))
 
         # solar_used in [0, effective_solar]
-        effective_solar = hours[h].solar_potential_kwh * (1.0 - solar_reduction[h])
+        # solar_reduction[h] can be passed as remaining ratio (e.g. 0.2) or reduction (e.g. 0.8)
+        if solar_reduction[h] > 0.0:
+            rem_ratio = solar_reduction[h] if solar_reduction[h] <= 0.5 else (1.0 - solar_reduction[h])
+            effective_solar = hours[h].solar_potential_kwh * rem_ratio
+        else:
+            effective_solar = hours[h].solar_potential_kwh
         bounds.append((0.0, effective_solar))
 
         # battery_charge
@@ -258,3 +311,108 @@ def solve_lp(req: SolveRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.post("/optimize-energy", response_model=OptimizeEnergyResponse)
+def optimize_energy(req: OptimizeEnergyRequest):
+    # Call Gemini
+    api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyAH8hOUK6TQhkFJz8DCp0nIvRdaNScVtOc")
+    client = genai.Client(api_key=api_key)
+    
+    prompt = f"""
+    You are an energy grid operator AI. Extract constraints from the following operator notes.
+    The response must be a JSON array with exactly {len(req.operator_notes)} items, in the exact same order as the notes (note_index 0 to {len(req.operator_notes)-1}).
+    
+    Valid directive_type values:
+    "solar_reduction", "no_charge_window", "no_discharge_window", "max_grid_window", "minimum_battery_reserve", "distractor"
+
+    Rules:
+    - Time ranges must be mapped to specific hours 0-23. "1 PM to 3 PM" means hours [13, 14]. "2 PM to 4 PM" means hours [14, 15].
+    - "solar_reduction": structured_adjustment must have "factor" which is the remaining fraction (e.g. 20% means 0.2).
+    - "no_charge_window": no extra numeric fields in structured_adjustment, just hours.
+    - If a note is irrelevant (e.g. "cafeteria menu changes"), applies = false, directive_type = "distractor", structured_adjustment = null.
+    
+    Notes:
+    {json.dumps(req.operator_notes)}
+    """
+    
+    try:
+        response = client.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=list[DirectiveInterpretation],
+                temperature=0.0
+            ),
+        )
+        interpretations = [DirectiveInterpretation(**item) for item in json.loads(response.text)]
+    except Exception as e:
+        print("Failed to parse Gemini output:", e)
+        raise HTTPException(status_code=500, detail="LLM parsing failed")
+        
+    # Map interpretations to ValidatedDirectives
+    validated_directives = []
+    for interp in interpretations:
+        if not interp.applies:
+            continue
+        adj = interp.structured_adjustment
+        if adj is None:
+            adj = StructuredAdjustment(hours=[])
+        
+        vd = ValidatedDirective(
+            original_note="",
+            directive_type=interp.directive_type,
+            hours=adj.hours,
+            reduction_factor=adj.factor if adj.factor is not None else 0.0,
+            min_reserve_kwh=adj.limit if adj.limit is not None else 0.0,
+            max_grid_kwh=adj.limit if adj.limit is not None else 0.0,
+        )
+        validated_directives.append(vd)
+        
+    # Map hours
+    hourly_records = []
+    for h in req.hours:
+        hourly_records.append(HourlyRecord(
+            hour=int(h.hour),
+            demand_kwh=h.demand_kwh,
+            solar_potential_kwh=h.solar_kwh,
+            tariff_bdt_per_kwh=h.tariff_bdt_per_kwh
+        ))
+        
+    # Map battery
+    battery_limits = BatteryLimits(
+        capacity_kwh=req.battery.capacity_kwh,
+        initial_energy_kwh=req.battery.initial_energy_kwh,
+        minimum_energy_kwh=req.battery.minimum_energy_kwh,
+        max_charge_rate_kw=req.battery.max_charge_kwh_per_hour,
+        max_discharge_rate_kw=req.battery.max_discharge_kwh_per_hour
+    )
+    
+    # Call internal LP solver
+    solve_req = SolveRequest(
+        scenario_id=req.scenario_id,
+        battery_limits=battery_limits,
+        hourly_records=hourly_records,
+        validated_directives=validated_directives
+    )
+    
+    solve_res = solve_lp(solve_req)
+    
+    # Map output
+    hourly_plan = []
+    for sched in solve_res.schedule:
+        hourly_plan.append(OutputHourlyPlan(
+            hour=sched.hour,
+            grid_kwh=sched.grid_kwh,
+            solar_used_kwh=sched.solar_used_kwh,
+            battery_energy_after_kwh=sched.battery_soc_kwh
+        ))
+        
+    return OptimizeEnergyResponse(
+        scenario_id=solve_res.scenario_id,
+        directive_interpretation=interpretations,
+        hourly_plan=hourly_plan,
+        total_grid_kwh=solve_res.total_grid_energy_kwh,
+        total_cost_bdt=solve_res.total_grid_cost_bdt,
+        peak_grid_kwh=solve_res.peak_grid_import_kwh
+    )

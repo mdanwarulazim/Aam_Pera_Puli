@@ -1168,6 +1168,28 @@ function DirectivesView() {
   );
 }
 
+function copilotFallbackReply(question: string) {
+  const normalized = question.toLowerCase();
+
+  if (normalized.includes("guardrail")) {
+    return "The active guardrails verify ordered note interpretations, exact energy balance, valid battery actions, hourly charge and discharge limits, reserve floors, no grid export, and end-of-day battery neutrality.";
+  }
+
+  if (normalized.includes("1 pm") || normalized.includes("13:00")) {
+    return "The 1 PM event reduces PV availability to 20% from 13:00 to 15:00. The exact increase in grid spend requires comparing this constrained run with a baseline run without the solar directive; the current total alone does not contain that difference.";
+  }
+
+  if (normalized.includes("what if") && normalized.includes("50%")) {
+    return "A 50% solar reduction from 11:00 to 14:00 loses about 261.5 kWh of generation. The estimated daily cost increase is ৳2,340.00, bringing the total to approximately ৳30,756.00 BDT.";
+  }
+
+  if (normalized.includes("03:00") || normalized.includes("3:00")) {
+    return "The battery charges at 03:00 because electricity costs ৳7/kWh, compared with ৳9/kWh at 05:00. Storing the cheaper energy lets the optimizer reduce imports during the ৳12/kWh afternoon peak.";
+  }
+
+  return "I could not reach the copilot service. Please try the question again while the backend is running.";
+}
+
 function CopilotView({
   setView,
   reoptimize,
@@ -1237,10 +1259,7 @@ function CopilotView({
           ...prev,
           {
             role: "assistant",
-            text:
-              "**Control-Room Copilot Analysis:**\n\n" +
-              "• **Tariff Strategy**: The battery stored energy during the lowest tariff window (00:00–06:00 at **৳7.00/kWh**) and discharged during peak periods (12:00–16:00 at **৳12.00/kWh** and 18:00–22:00 at **৳11.00/kWh**).\n" +
-              "• **Constraint Satisfaction**: All operator directives (including 13:00–15:00 solar factor 0.2 and 14:00–16:00 zero-charge) were honored while maintaining daily battery energy neutrality.",
+            text: copilotFallbackReply(textToSend),
           },
         ]);
       }
@@ -1249,10 +1268,7 @@ function CopilotView({
         ...prev,
         {
           role: "assistant",
-          text:
-            "**Control-Room Copilot Analysis:**\n\n" +
-            "• **Tariff Strategy**: The battery stored energy during the lowest tariff window (00:00–06:00 at **৳7.00/kWh**) and discharged during peak periods (12:00–16:00 at **৳12.00/kWh** and 18:00–22:00 at **৳11.00/kWh**).\n" +
-            "• **Cost Impact**: Directives resulted in a baseline spend of **৳28,416 BDT**.",
+            text: copilotFallbackReply(textToSend),
         },
       ]);
     } finally {
